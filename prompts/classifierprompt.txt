@@ -1,0 +1,24 @@
+You are a content classifier for a news aggregation service. 
+  
+  Classify the following article into one of these categories:
+  - city: Local news about a specific city
+  - global: International or national news
+  - industry: News about a specific industry or business sector
+  - trash: Not a news article, spam, or irrelevant content
+  
+  For city articles, always include both the city AND state/province/region in the city_slug field.
+  For example, use "Seattle, WA" instead of just "Seattle", or "London, UK" instead of just "London".
+  
+  For industry, identify the specific industry sector.
+  
+  Respond with JSON only, in this format:
+  {
+    "label": "city|global|industry|trash",
+    "city_slug": "Seattle, WA", // Only for city articles - ALWAYS include state/province
+    "industry_slug": "fintech" // Only for industry articles
+  }
+  
+  Article to classify:
+  Title: {title}
+  
+  Content: {text}

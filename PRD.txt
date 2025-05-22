@@ -1,0 +1,348 @@
+# Headline Content-Scraper – **Full Technical PRD (v2.0)**
+
+*Last updated **2025-05-16** – incorporates Diffbot implementation details and **direct-in-worker** embedding.*
+
+---
+
+## 1  Purpose
+
+Deliver a **single FastAPI service** that can
+
+| Route                   | Function                                                                 |
+| ----------------------- | ------------------------------------------------------------------------ |
+| `POST /scrape-article`  | Scrape & process **one** URL immediately                                 |
+| `POST /scrape-source`   | Harvest, classify & process every outbound link from **one** source page |
+| `POST /process-sources` | Orchestrate batch scraping for *N* sources stored in Supabase            |
+
+All valid content is stored in **`public.news_articles`** (city, global, industry—no separate tables).
+Every article is embedded **inside the worker** (no extra micro-service).
+
+Target runtime: **one Docker container** on either **AWS Lightsail** *or* **Fly.io**.
+
+---
+
+## 2  Success Criteria
+
+| KPI                     | Target                                    |
+| ----------------------- | ----------------------------------------- |
+| Duplicate URLs inserted | ≤ 1 % (UNIQUE constraint)                 |
+| 50-source batch latency | ≤ 10 min p95                              |
+| Worker crash impact     | Failure logged, next job continues        |
+| Code health             | `ruff` & `pylint ≥ 8`, functions ≤ 75 LOC |
+
+---
+
+## 3  Data Model (Supabase Postgres)
+
+```sql
+-- A. Articles table (single bucket)
+CREATE TABLE IF NOT EXISTS public.news_articles (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  url              TEXT UNIQUE NOT NULL,
+  url_canonical    TEXT UNIQUE NOT NULL,
+  title            TEXT,
+  summary_short    TEXT,
+  summary_medium   TEXT,
+  summary_long     TEXT,
+  audience_scope   TEXT NOT NULL,  -- '[city:seattle]' | '[global]' | '[industry:fintech]'
+  date_posted      TIMESTAMPTZ,
+  is_embedded      BOOLEAN DEFAULT FALSE,
+  vector_id        TEXT,
+  created_at       TIMESTAMPTZ DEFAULT now()
+);
+
+-- B. Heavy-dedupe registry
+CREATE TABLE IF NOT EXISTS public.processed_urls (
+  url           TEXT PRIMARY KEY,
+  status        TEXT,                   -- 'trash' | 'processed'
+  processed_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- C. Simple job queue (Supabase only, no Redis)
+CREATE TABLE IF NOT EXISTS public.scrape_jobs (
+  id            BIGSERIAL PRIMARY KEY,
+  job_type      TEXT NOT NULL,          -- 'article' | 'source' | 'batch'
+  payload       JSONB NOT NULL,
+  status        TEXT DEFAULT 'queued',  -- 'queued' | 'in_progress' | 'done' | 'error'
+  error_message TEXT,
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  updated_at    TIMESTAMPTZ DEFAULT now()
+);
+
+-- D. Prompt storage (provided)
+--   public.scraper_prompts (id, prompt, description, model, ...)
+```
+
+Indexes:
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS idx_news_articles_canon ON public.news_articles(url_canonical);
+CREATE INDEX IF NOT EXISTS idx_scrape_jobs_status ON public.scrape_jobs(status);
+```
+
+RLS: only service role may `INSERT`/`UPDATE`.
+
+---
+
+## 4  FastAPI HTTP Contracts
+
+| Route                   | JSON Body                                      | Returns                                                                     |                         |
+| ----------------------- | ---------------------------------------------- | --------------------------------------------------------------------------- | ----------------------- |
+| `POST /scrape-article`  | \`{ "url": "<string>", "source\_id": "\<uuid   | null>" }\`                                                                  | `202 {"job_id": <int>}` |
+| `POST /scrape-source`   | \`{ "source\_id": "<uuid>", "query": "\<string | null>", "limit": 100 }\`                                                    | `202 {"job_id": <int>}` |
+| `POST /process-sources` | \`{ "batch\_size": 50, "query": "\<string      | null>", "dry\_run": false }\`                                               | `202 {"job_id": <int>}` |
+| `GET  /jobs/{id}`       | —                                              | Live counters: `status, links_found, links_skipped, articles_saved, errors` |                         |
+
+JWT supplied in `Authorization: Bearer`.
+
+---
+
+## 5  Worker Pipeline
+
+Workers run inside the same container (`python -m headline_worker`) and loop every 2 s:
+
+### 5.1  Claim Job
+
+```sql
+UPDATE public.scrape_jobs
+SET status = 'in_progress', updated_at = now()
+WHERE id = (
+  SELECT id FROM public.scrape_jobs
+  WHERE status = 'queued'
+  ORDER BY id
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING id, job_type, payload;
+```
+
+### 5.2  Job Types
+
+| Type        | Flow                                                                                          |
+| ----------- | --------------------------------------------------------------------------------------------- |
+| **article** | -→ **Scrape Routine** (§ 5.3)                                                                 |
+| **source**  | Collect links (§ 5.4) → enqueue many `article` jobs                                           |
+| **batch**   | Select *N* sources from `bighippo_sources` (`FOR UPDATE SKIP LOCKED`) → enqueue `source` jobs |
+
+### 5.3  Scrape Routine (shared by all jobs)
+
+1. **Deduplicate** – skip if `processed_urls` contains canonical URL.
+2. **Download & Extract**
+
+   * **Playwright** headless Chromium, 3 s timeout.
+   * Run Mozilla Readability to pull title, date, text.
+   * On failure, fall back to **Diffbot** (§ 5.5).
+3. **GPT-4o-mini Classifier**
+
+   * Prompt fetched from `scraper_prompts` (`description = 'classifier'`).
+   * Output: `label`, optional `city_slug`, `industry_slug`.
+   * `trash` bypasses storage; URL saved in `processed_urls`.
+4. **Prompt A or B**
+
+   * Load by `description = 'city_prompt'` *or* `'global_industry_prompt'`.
+   * Fill summaries:
+
+     * City → `short+medium+long`
+     * Global/Industry → `short` only (store in `summary_short`; leave others NULL).
+5. **Insert** into `news_articles` (capturing `id`).
+6. **Embed** inside worker (§ 6).
+7. Save canonical URL in `processed_urls (status='processed')`.
+8. Update job `status = 'done'`.
+9. **Errors** → capture `traceback`, set `status='error'`, continue next job.
+
+### 5.4  Collect Links (for `source` jobs)
+
+1. Fetch HTML (Playwright).
+2. Gather `<a href>` + `meta[property=og:url]`.
+3. Canonicalise: lower-case scheme+host, strip `www.`, remove `#`, drop tracking params, trim trailing `/`.
+4. Filter obvious non-content (regex on file extensions & social hosts).
+5. For each surviving link not found in `processed_urls`, enqueue:
+
+```sql
+INSERT INTO scrape_jobs(job_type,payload)
+VALUES ('article', jsonb_build_object('url', :link, 'source_id', :source_id));
+```
+
+### 5.5  Diffbot Fallback Details
+
+```python
+import requests, itertools, time
+
+DIFFBOT_KEYS = os.getenv("DIFFBOT_KEYS").split(",")
+
+def fetch_via_diffbot(url):
+    key_cycle = itertools.cycle(DIFFBOT_KEYS)
+    for _ in range(len(DIFFBOT_KEYS)):          # try each key once
+        token = next(key_cycle)
+        resp = requests.get(
+            "https://api.diffbot.com/v3/article",
+            params={"token": token, "url": url},
+            timeout=12
+        )
+        if resp.status_code == 429:             # quota exceeded
+            continue                            # try next key
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("objects"):
+            return data["objects"][0]           # title, text, date
+    raise RuntimeError("All Diffbot keys exhausted")
+```
+
+Rules:
+
+* 12-second timeout per request.
+* Rotate keys round-robin; skip any that return **429** or **403**.
+* On final failure, mark job `error` and proceed.
+
+---
+
+## 6  **Direct Embedding Logic**
+
+### 6.1  Prepare Text
+
+```text
+[TITLE]:    {title}
+[LOCATION]: {city}, {state}
+[TOPICS]:   {main_topic}, {topic}, {topic_2}, {topic_3}
+[SUMMARY]:  {summary_short}
+```
+
+### 6.2  Generate Vector
+
+```python
+vector = openai.embeddings.create(
+    model="text-embedding-3-small",
+    input=prepared_text
+)["data"][0]["embedding"]          # 1536-dim list[float]
+```
+
+### 6.3  Pinecone Upsert
+
+```python
+pinecone.upsert(
+    namespace="articles",
+    vectors=[(
+        f"article_{article_id}",
+        vector,
+        {
+          "article_id": str(article_id),
+          "url": url, "title": title,
+          "summary": summary_short,
+          "date_posted": date_posted.isoformat() if date_posted else None,
+          "location": f"{city},{state}",
+          "topics": [t for t in (main_topic, topic, topic_2, topic_3) if t],
+          "last_updated": datetime.utcnow().isoformat()
+        }
+    )]
+)
+```
+
+### 6.4  DB Patch
+
+```sql
+UPDATE news_articles
+SET is_embedded = TRUE,
+    vector_id   = 'article_' || :article_id
+WHERE id = :article_id;
+```
+
+Semaphore: max 5 concurrent embedding calls to avoid rate-limits.
+
+Batch helper (`process_articles_by_date_range`) remains unchanged for back-fills.
+
+---
+
+## 7  Configuration (Environment Variables)
+
+| Key                                     | Required | Notes                    |
+| --------------------------------------- | -------- | ------------------------ |
+| `OPENAI_API_KEY`                        | ✔        | embeddings + GPT-4o mini |
+| `DIFFBOT_KEYS`                          | ✔        | comma-sep; rotate        |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | ✔        |                          |
+| `PINECONE_API_KEY` / `PINECONE_ENV`     | ✔        |                          |
+| `LOG_LEVEL`                             | ✖        | default `INFO`           |
+
+*No Redis URL needed.*
+
+---
+
+## 8  Container Build
+
+```dockerfile
+FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+WORKDIR /app
+COPY . .
+RUN apt-get update && apt-get install -y curl gnupg && \
+    pip install -r requirements.txt && \
+    playwright install chromium
+# Start both FastAPI and worker via supervisord
+CMD ["./start.sh"]
+```
+
+`start.sh`:
+
+```bash
+#!/usr/bin/env bash
+uvicorn headline_api.main:app --host 0.0.0.0 --port 8000 &
+python -m headline_worker
+wait -n
+```
+
+---
+
+## 9  Deployment Steps
+
+### Lightsail
+
+1. **Create Container Service** → plan **Medium** (2 vCPU / 4 GB).
+2. Upload/pull image; set env-vars.
+3. Attach static IP & SSL.
+4. Enable **public HTTP** (port 80/443).
+
+### Fly.io
+
+```bash
+fly launch
+fly secrets set OPENAI_API_KEY=... DIFFBOT_KEYS=... ...
+fly scale vm shared-cpu-2x
+```
+
+---
+
+## 10  Observability
+
+* **Sentry** SDK wraps FastAPI & worker loop.
+* **Prometheus** `/metrics` export:
+
+  * `scrape_jobs_total{status="done|error"}`
+  * `diffbot_requests_total`, `diffbot_429_total`
+  * `articles_embedded_total`
+* **Supabase scheduled function** posts daily Slack digest.
+
+---
+
+## 11  Development Checklist
+
+| #  | Task                                                   |
+| -- | ------------------------------------------------------ |
+| 1  | **Schema migration** (three new tables + indexes)      |
+| 2  | FastAPI routes, auth middleware, OpenAPI doc           |
+| 3  | Supabase job-queue helper (`enqueue_job`, `claim_job`) |
+| 4  | Playwright collector + canonicaliser + unit tests      |
+| 5  | Diffbot wrapper (rotate keys, timeout)                 |
+| 6  | GPT-4o-mini classifier util, response validator        |
+| 7  | Prompt cache (load from `scraper_prompts`, TTL 5 min)  |
+| 8  | City/industry audience-scope generator                 |
+| 9  | Process A/B formatter (summary builder)                |
+| 10 | Direct embedding module (prepare text, embed, upsert)  |
+| 11 | Worker main loop (error handling, metrics)             |
+| 12 | Docker build & start script                            |
+| 13 | CI (pytest, ruff, pylint)                              |
+| 14 | Lightsail/Fly deployment, smoke test                   |
+| 15 | Load test (≥ 1 000 links)                              |
+| 16 | README + run-book                                      |
+
+---
+
+### This document now contains every functional, architectural, and code-level requirement—including precise Diffbot usage and the full embedding workflow—needed for a coding agent to implement the service end-to-end.
