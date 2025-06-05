@@ -1,19 +1,41 @@
 #!/bin/bash
 # Start Headline Scraper - API and Worker
+#
+# Usage: ./start.sh [--resume-jobs]
+#
+# By default, any queued jobs from previous sessions will be cancelled on startup.
+# Use --resume-jobs to continue processing jobs from previous sessions.
+
+# Parse command line arguments
+RESUME_JOBS=""
+if [ "$1" = "--resume-jobs" ]; then
+    RESUME_JOBS="--resume-jobs"
+    echo "Will resume processing jobs from previous sessions"
+else
+    echo "Will cancel any queued jobs from previous sessions (use --resume-jobs to change this)"
+fi
 
 # Set up trap to kill worker when script exits
 trap 'kill $WORKER_PID 2>/dev/null; kill $API_PID 2>/dev/null; echo "Stopping all processes..."; exit 0' INT TERM EXIT
 
+# Check if virtual environment exists and activate it
+if [ -d "venv" ]; then
+    echo "Activating virtual environment..."
+    source venv/bin/activate
+    PYTHON_CMD="python"
+else
+    echo "Virtual environment not found. Using system Python..."
 # Determine which Python command to use
 PYTHON_CMD="python"
 if command -v python3 &>/dev/null; then
     PYTHON_CMD="python3"
+    fi
 fi
 
 # Function to check if required packages are installed
 check_dependencies() {
     local missing_deps=()
-    local all_deps=("fastapi" "uvicorn" "jinja2" "openai" "requests" "prometheus_client" "jose" "playwright" "pinecone")
+    local all_deps=("fastapi" "uvicorn" "jinja2" "openai" "requests" "prometheus_client" "playwright" "aiohttp")
     
     echo "Checking dependencies..."
     for dep in "${all_deps[@]}"; do
@@ -21,6 +43,16 @@ check_dependencies() {
             missing_deps+=("$dep")
         fi
     done
+    
+    # Check for packages with different import names
+    if ! $PYTHON_CMD -c "import jose" 2>/dev/null; then
+        missing_deps+=("python-jose")
+    fi
+    
+    # Pinecone is optional and only needed if ENABLE_EMBEDDINGS=true
+    # if ! $PYTHON_CMD -c "import pinecone" 2>/dev/null; then
+    #     missing_deps+=("pinecone")
+    # fi
     
     if [ ${#missing_deps[@]} -gt 0 ]; then
         echo "The following dependencies are missing: ${missing_deps[*]}"
@@ -56,7 +88,7 @@ fi
 
 # Start the worker in background
 echo "Starting worker..."
-$PYTHON_CMD -m headline_worker &
+$PYTHON_CMD -m headline_worker $RESUME_JOBS &
 WORKER_PID=$!
 
 # Verify worker started

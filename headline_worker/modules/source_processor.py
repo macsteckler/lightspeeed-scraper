@@ -5,14 +5,16 @@ from typing import Dict, Any, List, Optional
 import traceback
 from datetime import datetime
 
-from headline_api.models import JobType, JobStatus
+from headline_api.models import JobType, JobStatus, ProcessedUrlStatus
 from headline_api.db import (
     supabase, 
     check_processed_url, 
+    save_processed_url,
     update_job_counters
 )
 from headline_worker.modules.article_processor import process_article_job
-from headline_worker.modules.content_extractor import extract_content
+from headline_worker.modules.content_extractor import extract_content, is_meaningful_content
+from headline_worker.modules.content_classifier import classify_content
 from headline_worker.modules.url_utils import canonicalize_url
 from headline_worker.modules.link_collector import collect_links
 from headline_worker.metrics import ARTICLES_PROCESSED, JOBS_PROCESSED
@@ -86,14 +88,51 @@ async def process_source(job_id: str, payload: Dict[str, Any]) -> None:
                         ARTICLES_PROCESSED.labels(status="already_processed").inc()
                         continue
                     
-                    # Extract content from article URL
-                    article = await extract_content(article_url)
-                    if not article:
-                        logger.warning(f"No content extracted from article {article_url}")
-                        ARTICLES_PROCESSED.labels(status="no_content").inc()
+                    # Early URL validation - filter out obvious non-news URLs before extraction
+                    if not is_meaningful_content({}, article_url):  # Pass empty dict since we only check URL
+                        logger.info(f"URL matches obvious non-news pattern, skipping: {article_url}")
+                        ARTICLES_PROCESSED.labels(status="obvious_non_news").inc()
+                        # Save as processed but don't create article job
+                        save_processed_url(canonical_url, ProcessedUrlStatus.TRASH)
+                        skipped_count += 1
                         continue
                     
-                    # Create article job
+                    # Extract content from article URL
+                    try:
+                        article = await extract_content(article_url)
+                        if not article:
+                            logger.warning(f"No content extracted from article {article_url}")
+                            ARTICLES_PROCESSED.labels(status="no_content").inc()
+                            continue
+                    except Exception as extraction_error:
+                        logger.warning(f"Content extraction failed for {article_url}: {str(extraction_error)}")
+                        ARTICLES_PROCESSED.labels(status="extraction_failed").inc()
+                        error_count += 1
+                        continue
+                    
+                    # AI classification - let AI decide what's news vs non-news
+                    try:
+                        classification = await classify_content(
+                            article.get("title", ""), 
+                            article.get("text", ""), 
+                            article_url
+                        )
+                        
+                        if classification.label == "trash":
+                            logger.info(f"AI classified article as trash: {article_url}")
+                            ARTICLES_PROCESSED.labels(status="ai_classified_trash").inc()
+                            save_processed_url(canonical_url, ProcessedUrlStatus.TRASH)
+                            skipped_count += 1
+                            continue
+                            
+                        logger.info(f"AI classified article as {classification.label}, proceeding: {article_url}")
+                        
+                    except Exception as e:
+                        logger.warning(f"AI classification failed for {article_url}: {str(e)}, proceeding anyway")
+                        # If classification fails, proceed with processing but log it
+                        classification = None
+                    
+                    # Create article job only for meaningful, news content
                     article_payload = {
                         "url": article_url,
                         "source_id": source_id,
@@ -101,7 +140,12 @@ async def process_source(job_id: str, payload: Dict[str, Any]) -> None:
                         "text": article.get("text", ""),
                         "html": article.get("html", ""),
                         "markdown": article.get("markdown", ""),
-                        "metadata": article.get("metadata", {})
+                        "metadata": article.get("metadata", {}),
+                        "date": article.get("date"),
+                        "date_extraction_method": article.get("date_extraction_method"),
+                        "scraper_type": article.get("scraper_type"),
+                        "clean_html": article.get("clean_html"),
+                        "classification": classification.model_dump() if classification else None  # Pass classification to avoid re-classifying
                     }
                     
                     # Create job
@@ -135,12 +179,17 @@ async def process_source(job_id: str, payload: Dict[str, Any]) -> None:
             logger.info(f"Source {source_id} processing summary: {processed_count} processed, {skipped_count} skipped, {error_count} errors")
             
             # Update job counters if this is a job
-            if job_id.isdigit():
-                update_job_counters(int(job_id), {
-                    "articles_saved": processed_count,
-                    "links_skipped": skipped_count,
-                    "errors": error_count
-                })
+            if job_id is not None:
+                try:
+                    job_id_int = int(job_id) if isinstance(job_id, str) else job_id
+                    update_job_counters(job_id_int, {
+                        "articles_saved": processed_count,
+                        "links_skipped": skipped_count,
+                        "errors": error_count
+                    })
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not update job counters for job_id {job_id}: {str(e)}")
+                    # Don't fail the entire process for counter update issues
                     
         except Exception as e:
             logger.error(f"Failed to collect links from source {source_url}: {str(e)}\n{traceback.format_exc()}")

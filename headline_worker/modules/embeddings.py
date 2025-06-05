@@ -3,6 +3,12 @@ import logging
 import asyncio
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+
+import config
+
+# Only import pinecone if embeddings are enabled
+Pinecone = None
+if config.ENABLE_EMBEDDINGS:
 try:
     # Try importing using new syntax
     from pinecone import Pinecone
@@ -13,14 +19,12 @@ except (ImportError, Exception) as e:
         logger = logging.getLogger(__name__)
         logger.info("Using pinecone-client with Pinecone() constructor")
     except ImportError:
-        # If that fails too, re-raise original error
+            # If that fails too, log warning but don't crash
         logger = logging.getLogger(__name__)
-        logger.error(f"Failed to import pinecone: {str(e)}")
-        raise e
+            logger.warning(f"Failed to import pinecone: {str(e)}. Embeddings will be disabled.")
+            Pinecone = None
 
 import openai
-
-import config
 from headline_worker.metrics import ARTICLES_EMBEDDED
 
 logger = logging.getLogger(__name__)
@@ -210,6 +214,11 @@ async def embed_article(
     Raises:
         RuntimeError: If embedding fails
     """
+    # Skip embeddings if disabled
+    if not config.ENABLE_EMBEDDINGS or Pinecone is None:
+        logger.debug(f"Embeddings disabled, skipping article {article_id}")
+        return
+        
     try:
         # Prepare topics
         main_topic = None

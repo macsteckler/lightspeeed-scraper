@@ -46,7 +46,8 @@ async def process_article(
     title: str, 
     text: str,
     markdown: str,
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any],
+    clean_html: str = None
 ) -> Dict[str, Any]:
     """
     Process an article based on its classification using the appropriate prompt.
@@ -57,6 +58,7 @@ async def process_article(
         text: The article text
         markdown: The article content in markdown format
         metadata: The article metadata
+        clean_html: Clean HTML content (no header/footer) for better AI analysis
         
     Returns:
         Dictionary containing processed article data including summaries and metadata
@@ -75,11 +77,19 @@ async def process_article(
             
         # Format metadata as string
         metadata_str = "\n".join(f"{k}: {v}" for k, v in metadata.items())
+        
+        # Use clean HTML if available, otherwise use markdown
+        # Clean HTML provides better context for date extraction and analysis
+        content_for_analysis = clean_html if clean_html else markdown
+        
+        # Limit content size to avoid token limits - use more content since we have clean HTML
+        max_content_length = 6000 if clean_html else 4000
+        content_for_analysis = content_for_analysis[:max_content_length]
             
         # Format the prompt with article content
         formatted_prompt = prompt_template.replace(
             "${markdown.substring(0, 4000)}", 
-            markdown[:4000]  # Use first 4000 chars as specified in prompt
+            content_for_analysis  # Use clean HTML or markdown content
         ).replace(
             "${metadataString}",
             metadata_str
@@ -88,13 +98,13 @@ async def process_article(
         # Call OpenAI API with JSON response format
         client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
         
-        # Log the prompt we're sending
-        logger.debug(f"Sending prompt to OpenAI:\n{formatted_prompt}")
+        # Log the prompt we're sending (truncated for readability)
+        logger.debug(f"Sending prompt to OpenAI (first 500 chars):\n{formatted_prompt[:500]}...")
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You analyze news articles and provide structured summaries and metadata. Always respond with valid JSON."},
+                {"role": "system", "content": "You analyze news articles and provide structured summaries and metadata. Always respond with valid JSON. Pay special attention to extracting accurate publication dates from both metadata and content."},
                 {"role": "user", "content": formatted_prompt}
             ],
             temperature=0.3,
@@ -103,20 +113,20 @@ async def process_article(
         
         # Get the response text
         result_text = response.choices[0].message.content.strip()
-        logger.debug(f"Raw GPT response:\n{result_text}")
+        logger.debug(f"Raw GPT response (first 500 chars):\n{result_text[:500]}...")
         
         # Parse JSON response
         try:
             result = json.loads(result_text)
-            logger.debug(f"Parsed JSON result:\n{json.dumps(result, indent=2)}")
+            logger.debug(f"Parsed JSON result (keys): {list(result.keys())}")
         except json.JSONDecodeError as e:
             # Try to extract JSON from text if direct parsing fails
             logger.warning(f"Initial JSON parse failed: {str(e)}")
             cleaned_text = extract_json_from_text(result_text)
-            logger.debug(f"Cleaned text for parsing:\n{cleaned_text}")
+            logger.debug(f"Cleaned text for parsing (first 200 chars):\n{cleaned_text[:200]}...")
             try:
                 result = json.loads(cleaned_text)
-                logger.debug(f"Parsed JSON from cleaned text:\n{json.dumps(result, indent=2)}")
+                logger.debug(f"Parsed JSON from cleaned text (keys): {list(result.keys())}")
             except json.JSONDecodeError as e2:
                 logger.error(f"Failed to parse JSON response: {str(e2)}")
                 raise ValueError(f"Failed to parse response as JSON: {str(e2)}")

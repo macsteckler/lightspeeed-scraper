@@ -50,12 +50,35 @@ async def process_article_job(job_id: int, payload: Dict[str, Any]) -> None:
         update_job_status(job_id, JobStatus.DONE)
         return
     
-    # Extract content
-    content = await extract_content(url)
+    # Check if we have pre-extracted content in payload (from source processor)
+    if all(key in payload for key in ["title", "text", "metadata"]):
+        # Use pre-extracted content
+        content = {
+            "title": payload.get("title", ""),
+            "text": payload.get("text", ""),
+            "html": payload.get("html", ""),
+            "markdown": payload.get("markdown", ""),
+            "metadata": payload.get("metadata", {}),
+            "date": payload.get("date"),
+            "date_extraction_method": payload.get("date_extraction_method", "unknown"),
+            "scraper_type": payload.get("scraper_type", "unknown"),
+            "clean_html": payload.get("clean_html")
+        }
+        logger.info(f"Using pre-extracted content for {url}")
+    else:
+        # Extract content fresh (for direct article jobs)
+        content = await extract_content(url)
     
-    # Classify content
-    classification = await classify_content(content["title"], content["text"])
-    logger.info(f"Classification: {classification}")
+    # Check if we have pre-computed classification in payload
+    if payload.get("classification"):
+        # Use pre-computed classification to avoid re-classifying
+        from headline_api.models import ArticleClassification
+        classification = ArticleClassification.model_validate(payload["classification"])
+        logger.info(f"Using pre-computed classification for {url}: {classification.label}")
+    else:
+        # Classify content fresh (for direct article jobs or if classification failed earlier)
+        classification = await classify_content(content["title"], content["text"], url)
+        logger.info(f"Fresh classification for {url}: {classification}")
     
     if classification.label == "trash":
         logger.info(f"Article {url} classified as trash, skipping")
@@ -67,25 +90,45 @@ async def process_article_job(job_id: int, payload: Dict[str, Any]) -> None:
         update_job_status(job_id, JobStatus.DONE)
         return
     
+    # Validate content quality before expensive AI processing
+    if not content.get("text") or len(content.get("text", "").strip()) < 50:
+        logger.warning(f"Article {url} has insufficient content ({len(content.get('text', ''))} chars), skipping")
+        save_processed_url(canonical_url, ProcessedUrlStatus.TRASH)
+        update_job_status(job_id, JobStatus.DONE)
+        return
+    
     # Process article with appropriate prompt
     result = await process_article(
         classification=classification,
         title=content["title"],
         text=content["text"],
         markdown=content["markdown"],
-        metadata=content["metadata"]
+        metadata=content["metadata"],
+        clean_html=content.get("clean_html")
     )
     
     # Log the full result for debugging
     logger.info(f"Summary generator result: {json.dumps(result, indent=2)}")
     
-    # Parse date
+    # Parse date - now comes from our improved extraction system
     date_posted = None
     if content.get("date"):
         try:
             date_posted = datetime.fromisoformat(content["date"])
+            logger.info(f"Successfully parsed date: {date_posted} using method: {content.get('date_extraction_method', 'unknown')}")
         except (ValueError, TypeError):
             logger.warning(f"Could not parse date: {content.get('date')}")
+    else:
+        extraction_method = content.get("date_extraction_method", "unknown")
+        if extraction_method == "failed":
+            logger.info("No date found by extraction system - this is expected for non-news content (ads, job pages, etc.)")
+        else:
+            logger.warning("No date found by extraction system")
+    
+    # Log extraction method for monitoring
+    extraction_method = content.get("date_extraction_method", "unknown")
+    scraper_type = content.get("scraper_type", "unknown")
+    logger.info(f"Article processed with scraper: {scraper_type}, date method: {extraction_method}")
     
     # Extract complete city for processed_url table (for deduplication purposes)
     city_for_dedupe = "unknown"

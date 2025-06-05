@@ -41,13 +41,14 @@ def extract_json_from_text(text: str) -> str:
     # If no pattern match, return the original text 
     return text
 
-async def classify_content(title: str, text: str) -> ArticleClassification:
+async def classify_content(title: str, text: str, url: str = None) -> ArticleClassification:
     """
     Classify article content using GPT-4o-mini.
     
     Args:
         title: The article title
         text: The article text
+        url: The article URL (optional, but recommended for better classification)
         
     Returns:
         The classification result
@@ -59,6 +60,7 @@ async def classify_content(title: str, text: str) -> ArticleClassification:
         # Format the prompt with article content - catch format errors
         try:
             formatted_prompt = CLASSIFIER_PROMPT.format(
+                url=url or "URL not provided",
                 title=title,
                 text=text[:1000]  # Use first 1000 chars to save tokens
             )
@@ -67,8 +69,10 @@ async def classify_content(title: str, text: str) -> ArticleClassification:
             # Use a simpler fallback prompt with properly escaped JSON braces
             formatted_prompt = f"""
             Classify this article as city, global, industry, or trash. 
+            Consider URL patterns like jobs sites, advertising pages as trash.
             Respond in JSON format with "label" field.
             
+            URL: {url or "Not provided"}
             Title: {title}
             Content: {text[:1000]}
             """

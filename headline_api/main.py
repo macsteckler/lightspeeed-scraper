@@ -73,6 +73,7 @@ app.include_router(articles.router, prefix="/scrape-article", tags=["articles"])
 app.include_router(sources.router, prefix="/scrape-source", tags=["sources"])
 app.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 app.include_router(sources.batch_router, prefix="/process-sources", tags=["sources"])
+app.include_router(sources.multiple_router, prefix="/scrape-multiple-sources", tags=["sources"])
 
 @app.get("/health", tags=["system"], summary="Health Check", description="Check if the API is up and running")
 async def health_check():

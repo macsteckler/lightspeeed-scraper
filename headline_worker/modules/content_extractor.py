@@ -1,15 +1,15 @@
 """Content extraction module using Playwright and Readability."""
-import logging
-import asyncio
-from typing import Dict, Any, Optional, Tuple
-from datetime import datetime
 import re
+import logging
+from typing import Dict, Any, Optional
 from urllib.parse import urlparse, urlunparse, parse_qs
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from readability import Document
+from bs4 import BeautifulSoup
 
 from headline_worker.modules.diffbot import fetch_via_diffbot, fetch_via_diffbot_async
 from headline_worker.modules.url_utils import canonicalize_url
+from headline_worker.modules.date_extractor import extract_date_priority_system
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,34 @@ def convert_to_markdown(html_content: str) -> str:
     
     return text
 
+def clean_html_for_ai(html_content: str) -> str:
+    """
+    Clean HTML content for AI analysis by removing headers, footers, navigation, ads, etc.
+    Keep only the main article content.
+    """
+    # Remove script and style elements
+    html_content = re.sub(r'<script.*?</script>', '', html_content, flags=re.DOTALL)
+    html_content = re.sub(r'<style.*?</style>', '', html_content, flags=re.DOTALL)
+    
+    # Remove common non-content elements
+    patterns_to_remove = [
+        r'<nav.*?</nav>',  # Navigation
+        r'<header.*?</header>',  # Headers
+        r'<footer.*?</footer>',  # Footers
+        r'<aside.*?</aside>',  # Sidebars
+        r'<div[^>]*class="[^"]*(?:ad|advertisement|banner|sidebar|footer|header|nav|menu|social|related|comment)[^"]*".*?</div>',  # Ad/nav divs
+        r'<div[^>]*id="[^"]*(?:ad|advertisement|banner|sidebar|footer|header|nav|menu|social|related|comment)[^"]*".*?</div>',  # Ad/nav divs by ID
+    ]
+    
+    for pattern in patterns_to_remove:
+        html_content = re.sub(pattern, '', html_content, flags=re.DOTALL|re.IGNORECASE)
+    
+    # Clean up excessive whitespace
+    html_content = re.sub(r'\n\s*\n\s*\n', '\n\n', html_content)
+    html_content = html_content.strip()
+    
+    return html_content
+
 async def extract_content_with_playwright(url: str) -> Dict[str, Any]:
     """
     Extract content from a URL using Playwright and Readability.
@@ -55,14 +83,15 @@ async def extract_content_with_playwright(url: str) -> Dict[str, Any]:
         url: The URL to extract content from
         
     Returns:
-        Dictionary with extracted title, text, markdown, metadata and date
+        Dictionary with extracted title, text, markdown, metadata, clean_html and date
         
     Raises:
         RuntimeError: If content extraction fails
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        page = await browser.new_page()
+        context = await browser.new_context(ignore_https_errors=True)  # Ignore SSL certificate errors
+        page = await context.new_page()
         
         try:
             logger.info(f"Navigating to {url} with Playwright")
@@ -84,33 +113,7 @@ async def extract_content_with_playwright(url: str) -> Dict[str, Any]:
                     if key:
                         metadata[key] = content
             
-            # Try to find publication date
-            date_posted = None
-            for date_selector in [
-                'meta[property="article:published_time"]',
-                'meta[property="og:published_time"]',
-                'time[datetime]',
-                'meta[name="date"]',
-                'meta[name="pubdate"]'
-            ]:
-                try:
-                    date_element = await page.query_selector(date_selector)
-                    if date_element:
-                        if date_selector.startswith('meta'):
-                            date_str = await date_element.get_attribute('content')
-                        else:
-                            date_str = await date_element.get_attribute('datetime')
-                            
-                        if date_str:
-                            try:
-                                date_posted = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                                break
-                            except ValueError:
-                                pass
-                except Exception as e:
-                    logger.debug(f"Error extracting date: {str(e)}")
-            
-            # Get HTML content for Readability
+            # Get HTML content for Readability and AI analysis
             html_content = await page.content()
             doc = Document(html_content)
             
@@ -123,14 +126,30 @@ async def extract_content_with_playwright(url: str) -> Dict[str, Any]:
             
             markdown = convert_to_markdown(content)
             
+            # Clean HTML for AI analysis (remove header/footer/nav elements)
+            clean_html = clean_html_for_ai(content)
+            
             await browser.close()
+            
+            # Use the new date extraction priority system
+            extracted_date, extraction_method = await extract_date_priority_system(
+                scraper_type="playwright",
+                content=markdown,
+                metadata=metadata,
+                full_html=clean_html
+            )
+            
+            logger.info(f"Date extraction method used: {extraction_method}")
             
             return {
                 "title": title,
                 "text": text,
                 "markdown": markdown,
                 "metadata": metadata,
-                "date": date_posted.isoformat() if date_posted else None
+                "clean_html": clean_html,
+                "date": extracted_date.isoformat() if extracted_date else None,
+                "scraper_type": "playwright",
+                "date_extraction_method": extraction_method
             }
         except PlaywrightError as e:
             await browser.close()
@@ -149,7 +168,7 @@ async def extract_content(url: str) -> Dict[str, Any]:
         url: The URL to extract content from
         
     Returns:
-        Dictionary with extracted title, text, markdown, metadata and date
+        Dictionary with extracted title, text, markdown, metadata, clean_html and date
         
     Raises:
         RuntimeError: If content extraction fails with both methods
@@ -162,14 +181,36 @@ async def extract_content(url: str) -> Dict[str, Any]:
             diffbot_data = await fetch_via_diffbot_async(url)
             
             # Convert Diffbot's HTML to markdown
-            markdown = convert_to_markdown(diffbot_data.get("html", ""))
+            html_content = diffbot_data.get("html", "")
+            markdown = convert_to_markdown(html_content)
+            
+            # Convert to plain text
+            text = re.sub('<[^<]+?>', ' ', html_content).strip()
+            text = re.sub(r'\s+', ' ', text)
+            
+            # Clean HTML for AI analysis
+            clean_html = clean_html_for_ai(html_content)
+            
+            # Use the new date extraction priority system for Diffbot
+            extracted_date, extraction_method = await extract_date_priority_system(
+                scraper_type="diffbot",
+                diffbot_data=diffbot_data,
+                content=markdown,
+                metadata=diffbot_data.get("meta", {}),
+                full_html=clean_html
+            )
+            
+            logger.info(f"Date extraction method used: {extraction_method}")
             
             return {
                 "title": diffbot_data.get("title"),
-                "text": diffbot_data.get("text"),
+                "text": text,
                 "markdown": markdown,
                 "metadata": diffbot_data.get("meta", {}),
-                "date": diffbot_data.get("date")
+                "clean_html": clean_html,
+                "date": extracted_date.isoformat() if extracted_date else None,
+                "scraper_type": "diffbot",
+                "date_extraction_method": extraction_method
             }
         except Exception as diffbot_error:
             logger.error(f"Both extraction methods failed for {url}: {str(e)}, Diffbot: {str(diffbot_error)}")
@@ -214,3 +255,54 @@ def canonicalize_url(url: str) -> str:
     # Rebuild URL
     canonical = urlunparse((scheme, netloc, path, '', query, fragment))
     return canonical 
+
+def is_meaningful_content(content: Dict[str, Any], url: str) -> bool:
+    """
+    Check if content should be processed based on URL patterns only.
+    Rely on AI classification for content quality decisions.
+    
+    Args:
+        content: Extracted content dictionary
+        url: The source URL
+        
+    Returns:
+        True if content should be sent to AI classification, False for obvious non-news URLs
+    """
+    # Only filter out obvious non-news URL patterns that are never articles
+    url_lower = url.lower()
+    
+    # Domain-level filtering for obvious non-news sites
+    from urllib.parse import urlparse
+    domain = urlparse(url_lower).netloc.replace('www.', '')
+    
+    non_news_domains = [
+        'apps.apple.com', 'play.google.com', 'chrome.google.com',
+        'itunes.apple.com', 'music.apple.com',
+        'github.com', 'gitlab.com', 'bitbucket.org',
+        'linkedin.com', 'instagram.com', 'pinterest.com',
+        'youtube.com', 'youtu.be', 'vimeo.com',
+        'amazon.com', 'ebay.com', 'etsy.com',
+        'wikipedia.org', 'wikimedia.org'
+    ]
+    
+    if any(domain.endswith(non_domain) or domain == non_domain for non_domain in non_news_domains):
+        logger.debug(f"Domain matches obvious non-news site: {domain}")
+        return False
+    
+    # URL path patterns for obvious non-news content and RSS feeds
+    non_news_patterns = [
+        '/privacy-policy', '/privacy', '/terms-of-service', '/terms', 
+        '/contact-us', '/contact', '/about-us', '/about',
+        '/advertise-with-us', '/advertise',
+        '/sitemap', '/robots.txt', '.xml', '.json',
+        '/feed', '/rss', '/feeds/', '.rss', '.atom',  # RSS/Atom feeds
+        '/api/', '/wp-json/', '/xmlrpc.php'  # API endpoints
+    ]
+    
+    if any(pattern in url_lower for pattern in non_news_patterns):
+        logger.debug(f"URL matches obvious non-news pattern (including feeds): {url}")
+        return False
+    
+    # Everything else goes to AI classification - let AI decide what's news
+    logger.debug(f"Content will be sent to extraction and AI classification: {url}")
+    return True 
