@@ -38,13 +38,13 @@ class SourceTable(str, Enum):
 class ScrapeArticleRequest(BaseModel):
     """Request model for article scraping."""
     url: str
-    source_id: Optional[UUID] = None
+    source_id: Optional[Union[int, str]] = None  # Support both int and UUID strings
 
 
 class ScrapeSourceRequest(BaseModel):
     """Request model for source scraping."""
     url: str
-    source_id: Optional[UUID] = None
+    source_id: Optional[Union[int, str]] = None  # Support both int and UUID strings
     source_table: Optional[SourceTable] = None
     limit: int = 100
 
@@ -65,7 +65,7 @@ class ProcessSourcesRequest(BaseModel):
 
 class SourceToScrape(BaseModel):
     """Model for a single source to scrape."""
-    source_id: UUID
+    source_id: Union[int, str]  # Support both int (city_sources) and UUID strings (bighippo_sources)
     source_table: SourceTable
     limit: int = 100
 

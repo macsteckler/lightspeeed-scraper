@@ -10,7 +10,7 @@ import traceback
 
 import config
 from headline_api.models import JobType, JobStatus
-from headline_api.db import supabase, refresh_connection, test_connection
+from headline_api.db import refresh_connection, test_connection, claim_job
 from headline_worker.metrics import (
     JOBS_PROCESSED, 
     DIFFBOT_REQUESTS, 
@@ -71,15 +71,15 @@ signal.signal(signal.SIGTERM, handle_signal)
 
 def test_connection() -> bool:
     """
-    Test if the Supabase connection is healthy with timeout.
+    Test if the PostgreSQL connection is healthy with timeout.
     
     Returns:
         True if connection is healthy, False otherwise
     """
     try:
-        # Simple query to test connection with timeout
-        supabase.table("scrape_jobs").select("id").limit(1).execute()
-        return True
+        # Use the test_connection function from db module
+        from headline_api.db import test_connection as db_test_connection
+        return db_test_connection()
     except Exception as e:
         logger.warning(f"Connection test failed: {str(e)}")
         return False
@@ -118,15 +118,17 @@ async def claim_job() -> Optional[Dict[str, Any]]:
             
             last_connection_check = current_time
         
-        # Use the FOR UPDATE SKIP LOCKED pattern as described in the PRD
-        response = supabase.rpc("claim_job", {}).execute()
+        # Use the claim_job function from db module
+        from headline_api.db import claim_job as db_claim_job
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, db_claim_job)
         
-        if not response.data:
+        if not response:
             consecutive_failures = 0  # Reset failure counter on success
             return None
             
         consecutive_failures = 0  # Reset failure counter on success
-        return response.data[0]
+        return response
         
     except Exception as e:
         consecutive_failures += 1
@@ -165,10 +167,9 @@ async def mark_job_done(job_id: int) -> None:
     
     for attempt in range(max_retries + 1):
         try:
-            supabase.table("scrape_jobs").update({
-                "status": JobStatus.DONE.value,
-                "updated_at": "now()"  # This is a PostgreSQL function
-            }).eq("id", job_id).execute()
+            from headline_api.db import update_job_status
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, update_job_status, job_id, JobStatus.DONE)
             
             JOBS_PROCESSED.labels(job_type="unknown", status="done").inc()
             return  # Success, exit retry loop
@@ -202,11 +203,9 @@ async def mark_job_error(job_id: int, error: str) -> None:
     
     for attempt in range(max_retries + 1):
         try:
-            supabase.table("scrape_jobs").update({
-                "status": JobStatus.ERROR.value,
-                "error_message": error,
-                "updated_at": "now()"  # This is a PostgreSQL function
-            }).eq("id", job_id).execute()
+            from headline_api.db import update_job_status
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, update_job_status, job_id, JobStatus.ERROR, error)
             
             JOBS_PROCESSED.labels(job_type="unknown", status="error").inc()
             return  # Success, exit retry loop
@@ -237,27 +236,42 @@ async def cleanup_old_jobs() -> None:
     try:
         logger.info("Cleaning up old jobs from previous sessions...")
         
-        # Find all jobs that are still queued or in progress
-        response = supabase.table("scrape_jobs").select("id, job_type").in_(
-            "status", [JobStatus.QUEUED.value, JobStatus.IN_PROGRESS.value]
-        ).execute()
+        from headline_api.db import get_connection, return_connection
+        import psycopg2
         
-        if response.data:
-            job_ids = [job["id"] for job in response.data]
-            job_count = len(job_ids)
-            
-            logger.info(f"Found {job_count} old jobs to clean up: {job_ids}")
-            
-            # Mark them as cancelled
-            supabase.table("scrape_jobs").update({
-                "status": "cancelled",
-                "error_message": "Job cancelled due to worker restart",
-                "updated_at": "now()"
-            }).in_("status", [JobStatus.QUEUED.value, JobStatus.IN_PROGRESS.value]).execute()
-            
-            logger.info(f"Successfully cancelled {job_count} old jobs")
-        else:
-            logger.info("No old jobs found to clean up")
+        conn = None
+        try:
+            conn = get_connection()
+            with conn.cursor() as cur:
+                # Find all jobs that are still queued or in progress
+                cur.execute("""
+                    SELECT id, job_type FROM scrape_jobs 
+                    WHERE status IN ('queued', 'in_progress')
+                """)
+                jobs = cur.fetchall()
+                
+                if jobs:
+                    job_ids = [job["id"] for job in jobs]
+                    job_count = len(job_ids)
+                    
+                    logger.info(f"Found {job_count} old jobs to clean up: {job_ids}")
+                    
+                    # Mark them as cancelled
+                    cur.execute("""
+                        UPDATE scrape_jobs 
+                        SET status = 'cancelled', 
+                            error_message = 'Job cancelled due to worker restart', 
+                            updated_at = now()
+                        WHERE status IN ('queued', 'in_progress')
+                    """)
+                    conn.commit()
+                    
+                    logger.info(f"Successfully cancelled {job_count} old jobs")
+                else:
+                    logger.info("No old jobs found to clean up")
+        finally:
+            if conn:
+                return_connection(conn)
             
     except Exception as e:
         logger.error(f"Failed to clean up old jobs: {str(e)}")

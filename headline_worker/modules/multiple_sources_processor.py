@@ -4,7 +4,7 @@ import asyncio
 from typing import Dict, Any, List
 
 import config
-from headline_api.db import enqueue_job, update_job_status, update_job_counters, supabase
+from headline_api.db import enqueue_job, update_job_status, update_job_counters, get_source_by_id
 from headline_api.models import JobType, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -46,14 +46,14 @@ async def process_multiple_sources(job_id: int, payload: Dict[str, Any]) -> None
             logger.info(f"Processing source {source_id} from {source_table} with limit {limit}")
             
             # Get source details from database
-            response = supabase.table(source_table).select("*").eq("id", source_id).execute()
+            response = get_source_by_id(source_id, source_table)
             
-            if not response.data:
+            if not response:
                 logger.warning(f"Source {source_id} not found in table {source_table}")
                 errors += 1
                 continue
                 
-            source_data = response.data[0]
+            source_data = response
             
             # Try both source_url and url fields
             source_url = source_data.get("source_url") or source_data.get("url")

@@ -155,14 +155,14 @@ async def scrape_multiple_sources(
                     "limit": 50
                 },
                 {
-                    "source_id": "987fcdeb-51a2-43d1-9f4e-123456789abc",
+                    "source_id": 701,
                     "source_table": "city_sources", 
                     "limit": 25
                 }
             ],
             "dry_run": False
         },
-        description="List of sources to scrape with their table and limits"
+        description="List of sources to scrape with their table and limits (supports both integer IDs for city_sources and UUID strings for bighippo_sources)"
     )
 ):
     """

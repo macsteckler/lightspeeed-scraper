@@ -11,6 +11,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DIFFBOT_KEYS = os.getenv("DIFFBOT_KEYS", "").split(",") if os.getenv("DIFFBOT_KEYS") else []
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:eLv4hJt8A3Urye67@db.jcotpnywnrywfthrzvdk.supabase.co:5432/postgres")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "headline-articles")

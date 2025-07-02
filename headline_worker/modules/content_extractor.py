@@ -8,7 +8,7 @@ from readability import Document
 from bs4 import BeautifulSoup
 
 from headline_worker.modules.diffbot import fetch_via_diffbot, fetch_via_diffbot_async
-from headline_worker.modules.url_utils import canonicalize_url
+from headline_worker.modules.url_utils import canonicalize_url, is_valid_article_url
 from headline_worker.modules.date_extractor import extract_date_priority_system
 
 logger = logging.getLogger(__name__)
@@ -268,6 +268,26 @@ def is_meaningful_content(content: Dict[str, Any], url: str) -> bool:
     Returns:
         True if content should be sent to AI classification, False for obvious non-news URLs
     """
+    # Use enhanced URL validation from url_utils
+    from headline_worker.modules.url_utils import is_valid_article_url
+    
+    # For content filtering, we create a dummy base_url from the url itself
+    # since we're checking if this single URL should be processed
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Use the enhanced URL validation logic
+        if not is_valid_article_url(url, base_url):
+            logger.debug(f"URL filtered by enhanced validation: {url}")
+            return False
+            
+    except Exception as e:
+        logger.debug(f"Error in enhanced URL validation for {url}: {str(e)}")
+        # Fall back to basic filtering if enhanced validation fails
+        pass
+    
     # Only filter out obvious non-news URL patterns that are never articles
     url_lower = url.lower()
     

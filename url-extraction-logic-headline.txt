@@ -1,0 +1,477 @@
+const axios = require('axios');
+const { supabase } = require('../services/database');
+const { JSDOM } = require('jsdom');
+
+function cleanUrl(url) {
+    if (!url || typeof url !== 'string') {
+        console.log('Invalid URL input:', url);
+        return null;
+    }
+
+    try {
+        // Special handling for Mill Creek URLs - truncate at %20
+        if (url.includes('cityofmillcreek.com')) {
+            const percentIndex = url.indexOf('%20');
+            if (percentIndex !== -1) {
+                url = url.substring(0, percentIndex);
+            }
+        }
+
+        // Remove anything after a space in the URL (general cleaning)
+        const spaceIndex = url.indexOf(' ');
+        if (spaceIndex !== -1) {
+            url = url.substring(0, spaceIndex);
+        }
+        
+        // Remove any quoted strings that might be appended (general cleaning)
+        const quoteIndex = url.indexOf('"');
+        if (quoteIndex !== -1) {
+            url = url.substring(0, quoteIndex);
+        }
+        
+        // First, clean markdown link syntax
+        if (url.includes('[') && url.includes(']')) {
+            let match = url.match(/\[(.*?)\]\((.*?)\)/);
+            if (match) {
+                url = match[2]; // Extract the URL part from markdown link
+            }
+        }
+
+        // Early return if the URL contains JSON-like content
+        if (url.includes('{"') || url.includes('"}') || url.includes('","')) {
+            return null;
+        }
+
+        // Remove any surrounding quotes
+        let cleanedUrl = url.replace(/^["']|["']$/g, '');
+        
+        // Remove JSON artifacts
+        cleanedUrl = cleanedUrl.replace(/\[.*?\]/g, '');
+        cleanedUrl = cleanedUrl.replace(/\{.*?\}/g, '');
+        
+        // Remove non-URL parts
+        cleanedUrl = cleanedUrl.split('"')[0];
+        cleanedUrl = cleanedUrl.split(',')[0];
+        
+        // Basic URL validation
+        if (!cleanedUrl.startsWith('http://') && !cleanedUrl.startsWith('https://')) {
+            return null;
+        }
+
+        // Remove escaped characters
+        cleanedUrl = cleanedUrl.replace(/\\+/g, '');
+        
+        // Remove trailing punctuation
+        cleanedUrl = cleanedUrl.replace(/[)\]}.,]+$/, '');
+        
+        try {
+            // Try decoding if possible
+            cleanedUrl = decodeURIComponent(cleanedUrl.replace(/%25/g, '%'));
+        } catch (e) {
+            console.log(`Warning: Unable to decode URL: ${cleanedUrl}`);
+        }
+        
+        // Final URL validation
+        const parsedUrl = new URL(cleanedUrl);
+        return parsedUrl.toString();
+    } catch (error) {
+        // Don't log errors for obviously invalid URLs
+        if (!url.includes('"') && !url.includes(',')) {
+            console.error(`Error cleaning URL ${url}:`, error);
+        }
+        return null;
+    }
+}
+
+function isProblematicUrl(url) {
+    const problematicPatterns = [
+        /googletagmanager\.com/,
+        /datadoghq-browser-agent\.com/,
+        /\.js$/,
+        /\.css$/,
+        /\.(jpg|jpeg|png|gif|svg)$/
+    ];
+    return problematicPatterns.some(pattern => pattern.test(url));
+}
+
+function isUrlFromSameRegion(sourceUrl, articleUrl) {
+    try {
+        // Get domain from source URL
+        const sourceDomain = new URL(sourceUrl).hostname.replace('www.', '');
+        const sourceBaseDomain = sourceDomain.split('.').slice(-2).join('.');
+        
+        // Get domain from article URL
+        const articleDomain = new URL(articleUrl).hostname.replace('www.', '');
+        const articleBaseDomain = articleDomain.split('.').slice(-2).join('.');
+        
+        // First check: exact domain match
+        if (sourceDomain === articleDomain) {
+            return true;
+        }
+        
+        // Second check: base domain match (e.g., tampa.com matches news.tampa.com)
+        if (sourceBaseDomain === articleBaseDomain) {
+            return true;
+        }
+        
+        // Third check: Check if the article URL contains city/region-specific patterns from the source URL
+        const sourceParts = sourceDomain.split('.');
+        const cityIndicators = sourceParts[0].split('-'); // e.g., "tampa-news" -> ["tampa", "news"]
+        
+        // Check if any city indicator is present in the article URL
+        return cityIndicators.some(indicator => 
+            indicator.length > 3 && // Avoid short words
+            !['news', 'www', 'com', 'org', 'gov'].includes(indicator) && // Avoid common words
+            articleUrl.toLowerCase().includes(indicator.toLowerCase())
+        );
+        
+    } catch (error) {
+        console.error(`Error comparing URLs (${sourceUrl}, ${articleUrl}):`, error);
+        return false;
+    }
+}
+
+function shouldRetryWithProxy(error) {
+    const retryableStatuses = [403, 429, 500, 502, 503, 504];
+    const retryableCodes = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'];
+    
+    return (
+        retryableStatuses.includes(error.response?.status) ||
+        retryableCodes.includes(error.code) ||
+        error.message.includes('timeout')
+    );
+}
+
+function detectCaptchaFromHtml(html) {
+    if (!html) return false;
+    
+    // Check for actual captcha elements and forms
+    const captchaElements = [
+        'iframe[src*="captcha"]',
+        'iframe[src*="recaptcha"]',
+        'div.g-recaptcha',
+        'div[class*="captcha-container"]',
+        'form[action*="captcha"]',
+        'form[action*="cloudflare"]'
+    ];
+
+    try {
+        const dom = new JSDOM(html);
+        const document = dom.window.document;
+
+        // Check for actual captcha elements
+        for (const selector of captchaElements) {
+            if (document.querySelector(selector)) {
+                return true;
+            }
+        }
+
+        // Only check text content in specific elements that would indicate a blocking captcha
+        const mainContent = document.querySelector('main, body');
+        if (!mainContent) return false;
+
+        const textContent = mainContent.textContent.toLowerCase();
+        const blockingPhrases = [
+            'please complete the security check',
+            'please verify you are a human',
+            'our security system has detected unusual traffic',
+            'please prove you are human'
+        ];
+
+        return blockingPhrases.some(phrase => textContent.includes(phrase));
+    } catch (error) {
+        console.error('Error in captcha detection:', error);
+        return false;
+    }
+}
+
+async function checkUrlStatus(url) {
+    try {
+        // Check for 404 or error patterns in URL
+        const errorPatterns = ['/404/', '/error/', 'error.aspx', 'error.html'];
+        if (errorPatterns.some(pattern => url.toLowerCase().includes(pattern))) {
+            return { 
+                skip: true, 
+                reason: 'Error page URL pattern',
+                existsInDatabase: false 
+            };
+        }
+
+        // Verify URL accessibility
+        try {
+            const response = await axios.head(url, { 
+                timeout: 5000,
+                validateStatus: status => status === 200
+            });
+        } catch (error) {
+            if (error.response?.status === 404 || error.response?.status === 410) {
+                return { 
+                    skip: true, 
+                    reason: 'Page not found',
+                    existsInDatabase: false 
+                };
+            }
+        }
+
+        // Remove the 24-hour restriction - check all processed URLs
+        
+        // Check both tables in parallel
+        const [processedUrlResult, articleResult, classifiedUrlResult] = await Promise.all([
+            supabase
+                .from('processed_news_urls')
+                .select('is_news, classification_result, confidence, last_check_date')
+                .eq('url', url)
+                .single(),
+            
+            supabase
+                .from('news_articles')
+                .select('id')
+                .eq('url', url)
+                .single(),
+                
+            supabase
+                .from('classified_urls')
+                .select('is_news')
+                .eq('url', url)
+                .single()
+        ]);
+
+        if (articleResult.data) {
+            return { 
+                skip: true, 
+                reason: 'Existing article',
+                existsInDatabase: true 
+            };
+        }
+
+        // Check processed_news_urls table
+        if (processedUrlResult.data) {
+            return {
+                skip: true,
+                reason: 'Previously processed URL',
+                classification: processedUrlResult.data.classification_result,
+                isNews: processedUrlResult.data.is_news,
+                existsInDatabase: true,
+                confidence: processedUrlResult.data.confidence || 1.0
+            };
+        }
+        
+        // Check classified_urls table
+        if (classifiedUrlResult.data) {
+            return {
+                skip: true,
+                reason: 'Previously classified URL',
+                isNews: classifiedUrlResult.data.is_news === 1,
+                existsInDatabase: true,
+                confidence: 1.0
+            };
+        }
+
+        return { skip: false, existsInDatabase: false };
+    } catch (error) {
+        console.error(`Error checking URL status for ${url}:`, error);
+        return { skip: false, existsInDatabase: false };
+    }
+}
+
+const sectionPaths = [
+    '/live',
+    '/news',
+    '/sports',
+    '/weather',
+    '/shows',
+    '/about',
+    '/contact',
+    '/search',
+    '/tag',
+    '/category'
+];
+
+function shouldSkipUrl(url) {
+    if (!url) return true;
+
+    try {
+        const urlObj = new URL(url);
+        const path = urlObj.pathname.toLowerCase();
+        const hostname = urlObj.hostname.toLowerCase();
+        const fullUrl = url.toLowerCase();
+
+        // Skip root URLs or URLs with only hash
+        if (path === '/' || path === '' || url.includes('#')) {
+            console.log(`[SKIP] Root or hash-only URL: ${url}`);
+            return true;
+        }
+
+        // Skip main section pages but allow their subpages
+        if (sectionPaths.some(section => path === section)) {
+            console.log(`[SKIP] Main section page: ${url}`);
+            return true;
+        }
+
+        // Skip URLs with just query parameters and no path
+        if (path === '/' && urlObj.search) {
+            console.log(`[SKIP] Root URL with only query parameters: ${url}`);
+            return true;
+        }
+
+        // Special case: Always allow CivicAlerts URLs
+        if (path.toLowerCase().includes('civicalerts.aspx')) {
+            return false;
+        }
+
+        // Skip government website main pages and department pages
+        if (hostname.includes('.gov')) {
+            // Allow news articles from city-news directory with additional path segments
+            if (path.startsWith('/city-news/')) {
+                const pathSegments = path.split('/').filter(Boolean);
+                // Don't skip if it's an actual article (has more than just /city-news/)
+                if (pathSegments.length > 1 && !path.includes('?')) {
+                    return false;
+                }
+            }
+
+            // Skip navigation and informational pages
+            const govSkipPaths = [
+                '/city-government', '/departments', '/services',
+                '/business', '/community', '/recreation',
+                '/permits', '/utilities', '/transportation',
+                '/city-council', '/mayor', '/administration',
+                '/planning', '/development', '/police', '/video',
+                '/fire', '/parks', '/library', '/MyAccount', '/MyAccount.aspx', '/Business', '/Business.aspx', '/Our-Community', '/Our-Community.aspx',
+                '/municipal', '/public-works',
+                '/discover', '/city-news$', // Only skip the main news page
+                '/resident-resources', '/newcomers-guide',
+                '/about', '/contact', '/faqs',
+                '/meetings', '/events', '/calendar'
+            ];
+
+            // Check for common navigation page patterns
+            if (path === '/' || 
+                path.endsWith('/home') || 
+                path.endsWith('/index') ||
+                govSkipPaths.some(skipPath => {
+                    if (skipPath.endsWith('$')) {
+                        // Exact match for paths ending with $
+                        return path === skipPath.slice(0, -1);
+                    }
+                    return path.startsWith(skipPath);
+                })) {
+                console.log(`[SKIP] Government navigation/index page: ${url}`);
+                return true;
+            }
+        }
+
+        // Special case: Always allow campaign archive URLs
+        if (hostname.includes('campaign-archive.com')) {
+            return false;
+        }
+
+        // Skip URLs with static/media subdomains or paths
+        const staticPatterns = [
+            'images.', 'img.', 'cdn.', 'static.', 'image.',
+            'media.', 'assets.', 'videos.', 'video.',
+            'pics.', 'photos.', 'thumbs.', 'thumbnail.',
+            'mcdn.', 'lura.live', 'cloudfront.net',
+            'akamai.net', 'fastly.net', 'cloudinary.com',
+            'foxtv.', 'q13fox.'
+        ];
+
+        if (staticPatterns.some(pattern => hostname.includes(pattern))) {
+            console.log(`[SKIP] Static/media URL: ${url}`);
+            return true;
+        }
+
+        // Skip file extensions
+        const skipExtensions = [
+            // Images
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff',
+            // Videos
+            '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.m4v', '.webm',
+            // Audio
+            '.mp3', '.wav', '.ogg', '.m4a', '.aac',
+            // Documents
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+            // Other
+            '.css', '.js', '.json', '.xml', '.rss', '.zip', '.rar'
+        ];
+
+        if (skipExtensions.some(ext => path.endsWith(ext))) {
+            console.log(`[SKIP] URL with excluded extension: ${url}`);
+            return true;
+        }
+
+        // Skip non-article paths
+        const skipPaths = [
+            // Common non-article paths
+            '/search', '/tag', '/category', '/author', '/about', '/contact', '/privacy', '/terms', '/login', '/register', '/welcome',
+            '/contact', '/privacy', '/terms', '/login', '/register', '/public-safety', '/public-safety.aspx', '/public-safety.html', '/public-safety.php', '/public-safety.asp', '/public-safety.aspx', '/public-safety.html', '/public-safety.php', '/public-safety.asp',
+            '/subscribe', '/wp-admin', '/wp-includes', '/cdn-cgi', '#main-content', '/emergency-preparedness',
+            '/static', '/media', '/images', '/css', '/js', '/fonts', '/doing-business',
+            '/assets', '/weather', '/traffic', '/contests', '/apps',
+            '/advertise', '/careers', '/jobs', '/staff', '/newsletters',
+            '/subscribe', '/subscription', '/help', '/faq', '/support','/welcome',
+            '/calendar', '/events', '/directory', '/classified', '/person', '/winning-question', 
+            '/marketplace', '/shop', '/donate', '/giving', '/sponsors',
+            '/discover', '/development-pipeline', '/development', '/team',
+            '/pipeline', '/projects', '/construction', '/future-projects', '/links-you-saw-on-tv', '/ProfileCreate', '/ProfileCreate.aspx', '/ProfileEdit', '/ProfileEdit.aspx', '/ProfileView', '/ProfileView.aspx',
+            // Adding administrative page patterns
+            '/eeo-report', '/public-file', '/closed-captioning', '/Business', '/Business.aspx', '/Our-Community', '/Our-Community.aspx', '/City-Services',
+            '/fcc-applications', '/fcc-public-file', '/advertise-with-us',
+            '/station-info', '/corporate-info', '/legal', '/accessibility-statement'
+        ];
+
+        // Check if URL path matches any skip pattern
+        for (const pattern of skipPaths) {
+            if (path === pattern || path.startsWith(pattern + '/')) {
+            console.log(`[SKIP] Non-article path: ${url}`);
+            return true;
+            }
+        }
+
+        // Skip URLs with query parameters indicating non-article content
+        const skipQueryParams = [
+            'print=', 'share=', 'format=', 'output=',
+            'view=', 'action=', 'filter=', 'sort=',
+            'search=', 'query=', 'page=', 'ref='
+        ];
+
+        if (skipQueryParams.some(param => urlObj.search.includes(param))) {
+            console.log(`[SKIP] URL with excluded query params: ${url}`);
+            return true;
+        }
+
+        // Skip social media URLs
+        const socialPatterns = [
+            '/sharer/', '/share?', 'share-offsite', 
+            '/facebook', '/twitter', '/linkedin', '/pinterest', '/youtube',
+            'linkedin.com/sharing', 'facebook.com/sharer',
+            'twitter.com/share', 'pinterest.com/pin'
+        ];
+
+        if (socialPatterns.some(pattern => fullUrl.includes(pattern))) {
+            console.log(`[SKIP] Social media URL: ${url}`);
+            return true;
+        }
+
+        // Skip if URL is just the homepage
+        if (path === '/' || path === '') {
+            console.log(`[SKIP] Homepage URL: ${url}`);
+            return true;
+        }
+
+        return false;
+    } catch (error) {
+        console.error(`Error in shouldSkipUrl for ${url}:`, error);
+        return true;
+    }
+}
+
+module.exports = {
+    cleanUrl,
+    isProblematicUrl,
+    isUrlFromSameRegion,
+    shouldRetryWithProxy,
+    detectCaptchaFromHtml,
+    checkUrlStatus,
+    shouldSkipUrl
+};

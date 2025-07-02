@@ -7,10 +7,12 @@ from datetime import datetime
 
 from headline_api.models import JobType, JobStatus, ProcessedUrlStatus
 from headline_api.db import (
-    supabase, 
     check_processed_url, 
     save_processed_url,
-    update_job_counters
+    update_job_counters,
+    get_source_by_id,
+    update_source_scraped_at,
+    enqueue_job
 )
 from headline_worker.modules.article_processor import process_article_job
 from headline_worker.modules.content_extractor import extract_content, is_meaningful_content
@@ -39,11 +41,11 @@ async def process_source(job_id: str, payload: Dict[str, Any]) -> None:
     
     try:
         # Get source details from database using the specified table
-        source = supabase.table(source_table).select("*").eq("id", source_id).single().execute()
-        if not source.data:
+        source = get_source_by_id(source_id, source_table)
+        if not source:
             raise ValueError(f"Source {source_id} not found in table {source_table}")
             
-        source_data = source.data
+        source_data = source
         # Try both source_url and url fields
         source_url = source_data.get("source_url") or source_data.get("url")
         if not source_url:
@@ -148,20 +150,8 @@ async def process_source(job_id: str, payload: Dict[str, Any]) -> None:
                         "classification": classification.model_dump() if classification else None  # Pass classification to avoid re-classifying
                     }
                     
-                    # Create job
-                    job_data = {
-                        "job_type": JobType.ARTICLE.value,
-                        "status": JobStatus.QUEUED.value,
-                        "payload": article_payload
-                    }
-                    
-                    job = supabase.table("scrape_jobs").insert(job_data).execute()
-                    if not job.data:
-                        logger.error(f"Failed to create article job for {article_url}")
-                        ARTICLES_PROCESSED.labels(status="job_creation_failed").inc()
-                        continue
-                        
-                    article_job_id = job.data[0]["id"]
+                    # Create job using the new PostgreSQL function
+                    article_job_id = enqueue_job(JobType.ARTICLE, article_payload)
                     logger.info(f"Created article job {article_job_id} for {article_url}")
                     
                     # Process article immediately
@@ -196,10 +186,9 @@ async def process_source(job_id: str, payload: Dict[str, Any]) -> None:
             JOBS_PROCESSED.labels(job_type="source", status="link_collection_failed").inc()
             raise
                 
-        # Update the source's last_scraped_at timestamp
+        # Update last_scraped_at timestamp if it's a bighippo_sources table
         if source_table == "bighippo_sources":
-            update_data = {"last_scraped_at": datetime.now().isoformat()}
-            supabase.table(source_table).update(update_data).eq("id", source_id).execute()
+            update_source_scraped_at(source_id, source_table)
             logger.info(f"Updated last_scraped_at for source {source_id}")
                 
     except Exception as e:

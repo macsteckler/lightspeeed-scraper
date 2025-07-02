@@ -125,41 +125,9 @@ def is_valid_article_url(url: str, base_url: str) -> bool:
     Returns:
         bool: True if the URL is likely an article, False otherwise
     """
-    # Skip URLs that don't start with http:// or https://
-    if not url.startswith(('http://', 'https://')):
-        return False
-        
-    # Skip URLs with non-content extensions
-    if NON_CONTENT_EXTENSIONS.search(url):
-        return False
-        
-    # Skip social media links
-    if SOCIAL_HOSTS.search(url):
-        return False
-        
-    # Skip URLs that don't belong to the same domain
-    # Extract domain from base_url
-    try:
-        base_domain = re.search(r'https?://([^/]+)', base_url).group(1)
-        url_domain = re.search(r'https?://([^/]+)', url).group(1)
-        
-        # Strip www. prefix for comparison
-        base_domain = base_domain.replace('www.', '')
-        url_domain = url_domain.replace('www.', '')
-        
-        # Check if it's the same domain or a subdomain
-        if not (url_domain == base_domain or url_domain.endswith('.' + base_domain)):
-            # But allow common CDN domains that news sites might use
-            common_cdn_patterns = ['cdn.', 'media.', 'assets.', 'img.', 'images.']
-            is_cdn = any(cdn in url_domain for cdn in common_cdn_patterns)
-            if not is_cdn:
-                return False
-    except:
-        # If we can't parse the domain, consider it invalid
-        return False
-    
-    # Return true for everything else
-    return True
+    # Use the enhanced validation from url_utils
+    from headline_worker.modules.url_utils import is_valid_article_url as enhanced_is_valid_article_url
+    return enhanced_is_valid_article_url(url, base_url)
 
 async def collect_links_with_diffbot(url: str, limit: int = 100) -> List[str]:
     """
